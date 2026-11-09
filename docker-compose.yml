@@ -1,0 +1,264 @@
+services:
+  redis-broker:
+    image: redis:7.2-alpine
+    container_name: container_5b_redis_broker
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend_net
+    mem_limit: 256m
+    cpus: 0.5
+
+  etl-ingestor:
+    container_name: container_1_etl_ingestor
+    build:
+      context: ./containers/etl_ingestor
+      dockerfile: Dockerfile
+    user: "1002:1002"
+    ports:
+      - "8085:8080"
+    depends_on:
+      postgis-primary:
+        condition: service_healthy
+    volumes:
+      - ./containers/etl_ingestor/dags:/data_lake
+      - ./containers/etl_ingestor/src:/app/src
+      - ./containers/etl_ingestor/dags:/data_lake/airflow_home/dags
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - USER=vkr-engineer
+      - LOGNAME=vkr-engineer
+      - HOME=/tmp
+      - RBAC_ROLE=etl_ingestor
+      - TARGET_CRS=EPSG:32634
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - PG_HOST=postgis-primary
+      - PG_REPLICA_HOST=postgis-replica
+      - PG_PORT=5432
+      - PG_USER=vkr_admin
+      - PG_PASSWORD=vkr_secure_pass
+      - PG_DB=coastal_lakehouse
+      - AIRFLOW_HOME=/data_lake/airflow_home
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__WEBSERVER__WEB_SERVER_HOST=0.0.0.0
+      - AIRFLOW__WEBSERVER__WEB_SERVER_PORT=8080
+    command: ["airflow", "standalone"]
+    networks:
+      - backend_net
+    mem_limit: 1536m
+    cpus: 1.5
+  
+  postgis-primary:
+    container_name: container_3_postgis_primary
+    image: postgis/postgis:16-3.4-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=vkr_admin
+      - POSTGRES_PASSWORD=vkr_secure_pass
+      - POSTGRES_DB=coastal_lakehouse
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+    volumes:
+      - ./containers/postgis_primary/initdb:/docker-entrypoint-initdb.d:ro
+      - ./data_lake/postgres_primary_data:/var/lib/postgresql/data
+      - ./containers/etl_ingestor/dags:/data_lake
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vkr_admin -d coastal_lakehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend_net
+    mem_limit: 512m
+    cpus: 1.0
+
+  postgis-replica:
+    container_name: container_3a_postgis_replica
+    image: postgis/postgis:16-3.4-alpine
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    depends_on:
+      postgis-primary:
+        condition: service_healthy
+    environment:
+      - POSTGRES_USER=vkr_admin
+      - POSTGRES_PASSWORD=vkr_secure_pass
+      - POSTGRES_DB=coastal_lakehouse
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    entrypoint: ["/bin/bash", "/replica_entrypoint.sh"]
+    volumes:
+      - ./containers/postgis_replica/replica_entrypoint.sh:/replica_entrypoint.sh:ro
+      - ./data_lake/postgres_replica_data:/var/lib/postgresql/data
+      - ./containers/etl_ingestor/dags:/data_lake:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vkr_admin -d coastal_lakehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend_net
+    mem_limit: 512m
+    cpus: 1.0
+
+  cv-ml-trainer:
+    container_name: container_4_cv_ml_trainer
+    build:
+      context: ./containers/cv_ml_trainer
+      dockerfile: Dockerfile
+    user: "1002:1002"
+    depends_on:
+      postgis-primary:
+        condition: service_healthy
+    volumes:
+      - ./containers/etl_ingestor/dags:/data_lake
+      - ./containers/cv_ml_trainer/src:/app/src
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - HOME=/tmp
+      - PG_HOST=postgis-primary
+      - PG_REPLICA_HOST=postgis-replica
+      - PG_PORT=5432
+      - PG_USER=vkr_admin
+      - PG_PASSWORD=vkr_secure_pass
+      - PG_DB=coastal_lakehouse
+    networks:
+      - backend_net
+    mem_limit: 2048m
+    cpus: 2.0
+
+  gold-aggregator:
+    container_name: container_5_gold_aggregator
+    build:
+      context: ./containers/gold_aggregator
+      dockerfile: Dockerfile
+    user: "1002:1002"
+    depends_on:
+      postgis-primary:
+        condition: service_healthy
+    volumes:
+      - ./containers/etl_ingestor/dags:/data_lake
+      - ./containers/gold_aggregator/src:/app/src
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - HOME=/tmp
+      - PG_HOST=postgis-primary
+      - PG_REPLICA_HOST=postgis-replica
+      - PG_PORT=5432
+      - PG_USER=vkr_admin
+      - PG_PASSWORD=vkr_secure_pass
+      - PG_DB=coastal_lakehouse
+      - REDIS_HOST=redis-broker
+      - REDIS_PORT=6379
+    networks:
+      - backend_net
+    mem_limit: 1024m
+    cpus: 1.5
+
+  analytics-api:
+    container_name: container_6_analytics_api
+    build:
+      context: ./containers/analytics_api
+      dockerfile: Dockerfile
+    user: "1002:1002"
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      postgis-primary:
+        condition: service_healthy
+    volumes:
+      - ./containers/etl_ingestor/dags:/data_lake
+      - ./containers/analytics_api/src:/app/src
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - HOME=/tmp
+      - PG_HOST=postgis-primary
+      - PG_REPLICA_HOST=postgis-replica
+      - PG_PORT=5432
+      - PG_USER=vkr_admin
+      - PG_PASSWORD=vkr_secure_pass
+      - PG_DB=coastal_lakehouse
+      - REDIS_HOST=redis-broker
+      - REDIS_PORT=6379
+      - JWT_SECRET=vkr_coastal_secret_key_2026_kaliningrad
+    ports:
+      - "8000:8000"
+    networks:
+      - backend_net
+      - frontend_net
+    mem_limit: 1024m
+    cpus: 1.5
+
+  gis-dashboard:
+    container_name: container_7_gis_dashboard
+    build:
+      context: ./containers/gis_dashboard
+      dockerfile: Dockerfile
+    user: "1002:1002"
+    depends_on:
+      analytics-api:
+        condition: service_started
+      redis-broker:
+        condition: service_healthy
+    volumes:
+      - ./containers/etl_ingestor/dags:/data_lake
+      - ./containers/gis_dashboard/src:/app/src
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - HOME=/tmp
+      - API_BASE_URL=http://analytics-api:8000
+      - REDIS_HOST=redis-broker
+      - REDIS_PORT=6379
+      - PG_REPLICA_HOST=postgis-replica
+      - PG_HOST=postgis-primary
+      - PG_PORT=5432
+      - PG_USER=vkr_admin
+      - PG_PASSWORD=vkr_secure_pass
+      - PG_DB=coastal_lakehouse
+    ports:
+      - "8501:8501"
+    networks:
+      - frontend_net
+      - backend_net
+    mem_limit: 1024m
+    cpus: 1.5
+
+networks:
+  frontend_net:
+    driver: bridge
+  backend_net:
+    name: coastal_backend_net
+    driver: bridge
+    internal: false
+
+volumes:
+  data_lake_vol:
+    name: coastal_data_lake_vol
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/data_lake
